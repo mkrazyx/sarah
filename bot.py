@@ -8,37 +8,26 @@ from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatMemberStatus, ParseMode
 from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated, UserNotParticipant
 from pyrogram.types import InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup
-
-from config import (BOT_TOKEN, APP_ID, API_HASH, CHANNEL_ID, PORT, DB_URI, DB_NAME, SHORTLINK_URL,
-                    SHORTLINK_API, FORCE_SUB_CHANNEL, WORKERS, CUSTOM_CAPTION,
-                    START_MSG, FORCE_MSG, ADMINS)
+from config import *
 
 log = logging.getLogger("bot")
-SEP = "━" * 13  # divider line under the titles
-MAX_FILES = 200  # most files one link may deliver (stops a forged link from asking for millions)
 
-# ---------------------------------------------------------------- database
 db = pymongo.MongoClient(DB_URI)[DB_NAME]
 users, settings = db["users"], db["config"]
-run = asyncio.to_thread  # pymongo is blocking, so it runs off the event loop
+run = asyncio.to_thread
 
-# ---------------------------------------------------------------- client + state
 app = Client("Bot", api_id=APP_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=WORKERS)
 state = {"started": datetime.now(), "username": "", "db_channel": None, "invite": ""}
-STATES = {}       # admin id -> /genlink or /batch conversation in progress
-DELIVERING = set()  # users whose files are being sent right now
-BROADCAST = {"running": False}
+STATES = {}
+DELIVERING = set()
+BROADCAST = {"running": False, "cancel": False}
 
-
-# ---------------------------------------------------------------- helpers
 def encode(s: str) -> str:
     return base64.urlsafe_b64encode(s.encode()).decode().strip("=")
-
 
 def decode(s: str) -> str:
     s = s.strip("=")
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)).decode()
-
 
 async def _subscribed(_, client, msg):
     if not FORCE_SUB_CHANNEL or msg.from_user.id in ADMINS:
@@ -52,33 +41,26 @@ async def _subscribed(_, client, msg):
         return False
     return m.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER)
 
-
 subscribed = filters.create(_subscribed)
 admin_pm = filters.private & filters.user(ADMINS)
-
 
 def fmt(text, u):
     return text.format(first=u.first_name, last=u.last_name, id=u.id, mention=u.mention,
                        username="@" + u.username if u.username else None)
 
-
 def parse_link(payload):
-    """Message ids from a start link: "get-<id*channel>" or "get-<first*channel>-<last*channel>"."""
     parts = decode(payload).split("-")
     if parts[0] != "get" or len(parts) not in (2, 3):
         raise ValueError("unexpected link format")
     n = abs(state["db_channel"].id)
     nums = [int(p) for p in parts[1:]]
-    if any(x <= 0 or x % n for x in nums):  # made for another channel
+    if any(x <= 0 or x % n for x in nums):
         raise ValueError("link was not generated for this DB channel")
     ids = [x // n for x in nums]
     if len(ids) == 2:
         a, b = ids
         ids = range(a, b + 1) if a <= b else range(a, b - 1, -1)
-    if len(ids) > MAX_FILES:
-        raise ValueError("too many files")
     return list(ids)
-
 
 async def get_messages(ids):
     out = []
@@ -91,9 +73,7 @@ async def get_messages(ids):
             out += await app.get_messages(state["db_channel"].id, chunk)
     return out
 
-
 def get_message_id(msg) -> int:
-    """Message id in the DB channel from a forward or a t.me link (0 if not from it)."""
     ch = state["db_channel"]
     if msg.forward_from_chat:
         return (msg.forward_from_message_id or 0) if msg.forward_from_chat.id == ch.id else 0
@@ -105,9 +85,7 @@ def get_message_id(msg) -> int:
                 return mid
     return 0
 
-
 async def get_shortlink(link: str) -> str:
-    """Shortened link, or the plain link if the shortener is not set or fails."""
     row = await run(settings.find_one, {"_id": "shortener_config"}) or {}
     site = row.get("shortener") or SHORTLINK_URL
     api = row.get("shortener_api") or SHORTLINK_API
@@ -125,11 +103,9 @@ async def get_shortlink(link: str) -> str:
             return data["shortlink"] if shareus else data["shortenedUrl"]
         log.warning("shortener error: %s", data.get("message"))
     except Exception as e:
-        log.warning("shortener error: %s", type(e).__name__)  # not the message: it can contain the API key
+        log.warning("shortener error: %s", type(e).__name__)
     return link
 
-
-# ---------------------------------------------------------------- user handlers
 @app.on_message(filters.command("start") & filters.private & subscribed)
 async def start(client, message):
     uid = message.from_user.id
@@ -185,7 +161,6 @@ async def start(client, message):
         fmt(START_MSG, message.from_user), quote=True, disable_web_page_preview=True,
         reply_markup=Markup([[Btn("😊 About Me", callback_data="about"), Btn("🔒 Close", callback_data="close")]]))
 
-
 @app.on_message(filters.command("start") & filters.private)
 async def not_joined(client, message):
     buttons = [[Btn("🔆 Click Here To Join 🧤", url=state["invite"])]]
@@ -194,9 +169,13 @@ async def not_joined(client, message):
     await message.reply(fmt(FORCE_MSG, message.from_user), reply_markup=Markup(buttons),
                         quote=True, disable_web_page_preview=True)
 
-
 @app.on_callback_query()
 async def callbacks(client, query):
+    if query.data == "cancel_broadcast":
+        if query.from_user.id not in ADMINS:
+            return await query.answer("🚫 Not authorized.", show_alert=True)
+        BROADCAST["cancel"] = True
+        return await query.answer("🛑 Cancelling…")
     if query.data == "about":
         await query.message.edit_text("<b>○ Creator : @MrKrazyBot</b>", disable_web_page_preview=True,
                                       reply_markup=Markup([[Btn("🔒 Close", callback_data="close")]]))
@@ -208,23 +187,9 @@ async def callbacks(client, query):
             pass
     await query.answer()
 
-
-# ---------------------------------------------------------------- admin handlers
 @app.on_message(admin_pm & filters.command("users"))
 async def users_count(client, message):
     await message.reply(f"👥 <b>{await run(users.count_documents, {})}</b> users are using this bot")
-
-
-@app.on_message(admin_pm & filters.command("stats"))
-async def stats(client, message):
-    s = int((datetime.now() - state["started"]).total_seconds())
-    d, s = divmod(s, 86400)
-    h, s = divmod(s, 3600)
-    m, s = divmod(s, 60)
-    total = await run(users.count_documents, {})
-    await message.reply(f"📊 <b>Bot Stats</b>\n{SEP}\n\n⏱ Uptime: <code>{d}d {h}h {m}m {s}s</code>\n"
-                        f"👥 Users: <code>{total}</code>")
-
 
 @app.on_message(admin_pm & filters.command("broadcast"))
 async def broadcast(client, message):
@@ -236,71 +201,84 @@ async def broadcast(client, message):
     if BROADCAST["running"]:
         return await message.reply("⏳ A broadcast is already running.")
 
-    BROADCAST["running"] = True
+    BROADCAST.update(running=True, cancel=False)
+    cancel = Markup([[Btn("❌ Cancel", callback_data="cancel_broadcast")]])
     try:
         ids = await run(lambda: [d["_id"] for d in users.find({}, {"_id": 1})])
-        status = await message.reply(f"📢 <b>Broadcasting…</b>\n{SEP}\n\n👥 Total: <code>{len(ids)}</code>\n"
-                                     "<i>This will take some time</i>")
-        ok = blocked = deleted = failed = 0
-        for uid in ids:
+        count = dict(ok=0, blocked=0, deleted=0, failed=0)
+
+        def report(title):
+            left = len(ids) - sum(count.values())
+            return (f"{title}\n━━━━━━━━━━━━━\n\n👥 Total: <code>{len(ids)}</code>\n"
+                    f"✅ Sent: <code>{count['ok']}</code>\n🚫 Blocked: <code>{count['blocked']}</code>\n"
+                    f"👻 Deleted: <code>{count['deleted']}</code>\n❌ Failed: <code>{count['failed']}</code>\n"
+                    f"⏳ Remaining: <code>{left}</code>")
+
+        status = await message.reply(report("📢 <b>Broadcasting…</b>"), reply_markup=cancel)
+        for number, uid in enumerate(ids, 1):
+            if BROADCAST["cancel"]:
+                break
             try:
                 try:
                     await src.copy(uid)
                 except FloodWait as e:
                     await asyncio.sleep(e.value)
                     await src.copy(uid)
-                ok += 1
+                count["ok"] += 1
             except UserIsBlocked:
                 await run(users.delete_one, {"_id": uid})
-                blocked += 1
+                count["blocked"] += 1
             except InputUserDeactivated:
                 await run(users.delete_one, {"_id": uid})
-                deleted += 1
+                count["deleted"] += 1
             except Exception:
-                failed += 1
-        await status.edit(f"✅ <b>Broadcast Completed</b>\n{SEP}\n\n👥 Total: <code>{len(ids)}</code>\n"
-                          f"✅ Sent: <code>{ok}</code>\n🚫 Blocked: <code>{blocked}</code>\n"
-                          f"👻 Deleted: <code>{deleted}</code>\n❌ Failed: <code>{failed}</code>")
+                count["failed"] += 1
+            if number % 25 == 0:
+                try:
+                    await status.edit(report("📢 <b>Broadcasting…</b>"), reply_markup=cancel)
+                except Exception:
+                    pass
+        await status.edit(report("🛑 <b>Broadcast Cancelled</b>" if BROADCAST["cancel"] else "✅ <b>Broadcast Completed</b>"))
     finally:
         BROADCAST["running"] = False
 
+@app.on_message(admin_pm & filters.command("genlink"))
+async def genlink(client, message):
+    STATES[message.from_user.id] = {"first": None, "at": datetime.now()}
+    await message.reply("📨 Forward the <b>DB message</b> or send its link.")
 
-@app.on_message(admin_pm & filters.command(["genlink", "batch"]))
-async def link_command(client, message):
-    batch = message.command[0].lower() == "batch"
-    STATES[message.from_user.id] = {"batch": batch, "first": None, "at": datetime.now()}
-    await message.reply("📨 Forward the <b>first</b> DB message or send its link." if batch
-                        else "📨 Forward the <b>DB message</b> or send its link.")
-
-
-async def link_input(message, st):
-    """Next step of a /genlink or /batch conversation."""
-    uid = message.from_user.id
-    mid = get_message_id(message)
-    if not mid:
-        return await message.reply("❌ This post/link is not from my DB channel.", quote=True)
-    if st["batch"] and st["first"] is None:
-        st["first"] = mid
-        return await message.reply("📩 Forward the <b>last</b> DB message or send its link.")
-
-    STATES.pop(uid, None)
+async def make_link(message, first, last):
     n = abs(state["db_channel"].id)
-    payload = f"get-{st['first'] * n}-{mid * n}" if st["batch"] else f"get-{mid * n}"
+    payload = f"get-{first * n}" if first == last else f"get-{first * n}-{last * n}"
     link = f"https://telegram.me/{state['username']}?start={encode(payload)}"
     short = await get_shortlink(link)
     await message.reply_text(
-        f"🔗 <b>Link Generated</b>\n{SEP}\n\n📎 <b>Link:</b> {link}\n\n⚡ <b>Short Link:</b> <code>{short}</code>",
+        f"🔗 <b>Link Generated</b>\n━━━━━━━━━━━━━\n\n📎 <b>Link:</b> {link}\n\n⚡ <b>Short Link:</b> <code>{short}</code>",
         quote=True, disable_web_page_preview=True)
 
+@app.on_message(admin_pm & filters.command("done"))
+async def done(client, message):
+    st = STATES.pop(message.from_user.id, None)
+    if not st or not st["first"]:
+        return await message.reply("❌ Nothing to finish. Use /genlink first.")
+    await make_link(message, st["first"], st["first"])
 
-COMMANDS = ["start", "users", "broadcast", "batch", "genlink", "stats", "shortlink", "shortener"]
+async def link_input(message, st):
+    mid = get_message_id(message)
+    if not mid:
+        return await message.reply("❌ This post/link is not from my DB channel.", quote=True)
+    if st["first"] is None:
+        st["first"] = mid
+        return await message.reply("📩 Forward the <b>last</b> DB message or send its link or click /done")
+    STATES.pop(message.from_user.id, None)
+    await make_link(message, st["first"], mid)
 
+COMMANDS = ["start", "users", "broadcast", "genlink", "done", "shortlink", "shortener"]
 
 @app.on_message(admin_pm & ~filters.command(COMMANDS))
 async def admin_text(client, message):
-    """Continue /genlink or /batch, otherwise shorten the first link in the message."""
     st = STATES.get(message.from_user.id)
-    if st and (datetime.now() - st["at"]).total_seconds() > 120:  # abandoned conversation
+    if st and (datetime.now() - st["at"]).total_seconds() > 120:
         STATES.pop(message.from_user.id, None)
         st = None
     if st:
@@ -315,9 +293,8 @@ async def admin_text(client, message):
     link = link.replace("telegram.me/+", "telegram.me/%2B")
     short = await get_shortlink(link)
     await message.reply_text(
-        f"⚡ <b>Short Link Ready</b>\n{SEP}\n\n📎 <b>Original:</b> {text}\n\n🔗 <b>Short:</b> <code>{short}</code>",
+        f"⚡ <b>Short Link Ready</b>\n━━━━━━━━━━━━━\n\n📎 <b>Original:</b> {text}\n\n🔗 <b>Short:</b> <code>{short}</code>",
         quote=True, disable_web_page_preview=True)
-
 
 @app.on_message(admin_pm & filters.command("shortlink"))
 async def set_shortlink(client, message):
@@ -326,17 +303,14 @@ async def set_shortlink(client, message):
     site, api = re.sub(r"^https?://", "", message.command[1]).rstrip("/"), message.command[2]
     await run(settings.update_one, {"_id": "shortener_config"},
               {"$set": {"shortener": site, "shortener_api": api}}, True)
-    await message.reply(f"✅ <b>Shortener Updated</b>\n{SEP}\n\n<b>🌍 Site:</b> <code>{site}</code>\n<b>🔑 API:</b> <code>{api}</code>")
-
+    await message.reply(f"✅ <b>Shortener Updated</b>\n━━━━━━━━━━━━━\n\n<b>🌍 Site:</b> <code>{site}</code>\n<b>🔑 API:</b> <code>{api}</code>")
 
 @app.on_message(admin_pm & filters.command("shortener"))
 async def show_shortener(client, message):
     row = await run(settings.find_one, {"_id": "shortener_config"}) or {}
-    await message.reply(f"🔗 <b>Shortener</b>\n{SEP}\n\n🌍 <b>Site</b>: <code>{row.get('shortener') or SHORTLINK_URL}</code>\n"
+    await message.reply(f"🔗 <b>Shortener</b>\n━━━━━━━━━━━━━\n\n🌍 <b>Site</b>: <code>{row.get('shortener') or SHORTLINK_URL}</code>\n"
                         f"🔑 <b>API:</b> <code>{row.get('shortener_api') or SHORTLINK_API}</code>")
 
-
-# ---------------------------------------------------------------- run
 async def main():
     await app.start()
     app.set_parse_mode(ParseMode.HTML)
@@ -374,7 +348,6 @@ async def main():
     log.info("Bot started successfully.")
     await idle()
     await app.stop()
-
 
 if __name__ == "__main__":
     app.run(main())
