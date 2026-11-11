@@ -3,23 +3,25 @@ import logging
 
 env = os.environ.get
 
-TG_BOT_TOKEN = env("TG_BOT_TOKEN", "8191103559:AAG-6navNOYM0pSAZqDYzzwsLBSXS-EsRHI")
+BOT_TOKEN = env("BOT_TOKEN", "8191103559:AAG-6navNOYM0pSAZqDYzzwsLBSXS-EsRHI")
 APP_ID = int(env("APP_ID", "1736204"))
 API_HASH = env("API_HASH", "890d40e0f91a4de32dec2965444b2cbe")
 CHANNEL_ID = int(env("CHANNEL_ID", "-1001205507869"))
 OWNER_ID = int(env("OWNER_ID", "1058015838"))
 PORT = int(env("PORT", "8080"))
 DB_URI = env("DATABASE_URL", "mongodb+srv://herostore:herostore@herostore.ywtvule.mongodb.net/?appName=herostore")
-DB_NAME = env("DATABASE_NAME", "jisoo")
+DB_NAME = env("DATABASE_NAME", "filestore")
 SHORTLINK_URL = env("SHORTLINK_URL", "nowshort.com")
 SHORTLINK_API = env("SHORTLINK_API", "c576b9cdd34ceb572a8df1f57eabf7c11efbda3a")
 FORCE_SUB_CHANNEL = int(env("FORCE_SUB_CHANNEL", "0"))
 WORKERS = int(env("TG_BOT_WORKERS", "4"))
 CUSTOM_CAPTION = env("CUSTOM_CAPTION")
-PROTECT_CONTENT = env("PROTECT_CONTENT", "False") == "True"
 START_MSG = env("START_MESSAGE", "Hello {first}\n\nI can store private files in Specified Channel and other users can access it from special link.")
 FORCE_MSG = env("FORCE_SUB_MESSAGE", "Hello {first}\n\n<b>You need to join in my Channel/Group to use me\n\nKindly Please join Channel</b>")
-ADMINS = [int(x) for x in env("ADMINS", "5051689666 1058015838 6012123382").split()] + [OWNER_ID]
+ADMINS = list(dict.fromkeys(
+    [int(x) for x in env("ADMINS", "1058015838").replace(",", " ").split()] + [OWNER_ID]))  # no duplicates
+
+SEP = "━" * 13  # divider line under the titles
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s - %(levelname)s] - %(name)s - %(message)s")
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
