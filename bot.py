@@ -11,9 +11,10 @@ from pyrogram.types import InlineKeyboardButton as Btn, InlineKeyboardMarkup as 
 
 from config import (BOT_TOKEN, APP_ID, API_HASH, CHANNEL_ID, PORT, DB_URI, DB_NAME, SHORTLINK_URL,
                     SHORTLINK_API, FORCE_SUB_CHANNEL, WORKERS, CUSTOM_CAPTION,
-                    START_MSG, FORCE_MSG, ADMINS, SEP)
+                    START_MSG, FORCE_MSG, ADMINS)
 
 log = logging.getLogger("bot")
+SEP = "━" * 13  # divider line under the titles
 MAX_FILES = 200  # most files one link may deliver (stops a forged link from asking for millions)
 
 # ---------------------------------------------------------------- database
@@ -187,9 +188,9 @@ async def start(client, message):
 
 @app.on_message(filters.command("start") & filters.private)
 async def not_joined(client, message):
-    buttons = [[Btn("📢 Join Channel", url=state["invite"])]]
+    buttons = [[Btn("🔆 Click Here To Join 🧤", url=state["invite"])]]
     if len(message.command) > 1:
-        buttons.append([Btn("🔄 Try Again", url=f"https://t.me/{state['username']}?start={message.command[1]}")])
+        buttons.append([Btn("Try Again ♻", url=f"https://t.me/{state['username']}?start={message.command[1]}")])
     await message.reply(fmt(FORCE_MSG, message.from_user), reply_markup=Markup(buttons),
                         quote=True, disable_web_page_preview=True)
 
@@ -325,15 +326,14 @@ async def set_shortlink(client, message):
     site, api = re.sub(r"^https?://", "", message.command[1]).rstrip("/"), message.command[2]
     await run(settings.update_one, {"_id": "shortener_config"},
               {"$set": {"shortener": site, "shortener_api": api}}, True)
-    await message.reply(f"✅ <b>Shortener Updated</b>\n{SEP}\n\n🌍 Site: <code>{site}</code>\n🔑 API: <code>{api}</code>")
+    await message.reply(f"✅ <b>Shortener Updated</b>\n{SEP}\n\n<b>🌍 Site:</b> <code>{site}</code>\n<b>🔑 API:</b> <code>{api}</code>")
 
 
 @app.on_message(admin_pm & filters.command("shortener"))
 async def show_shortener(client, message):
     row = await run(settings.find_one, {"_id": "shortener_config"}) or {}
-    await message.reply(f"🔗 <b>Shortener</b>\n{SEP}\n\n🌍 Site: <code>{row.get('shortener') or SHORTLINK_URL}</code>\n"
-                        f"🔑 API: <code>{row.get('shortener_api') or SHORTLINK_API}</code>\n\n"
-                        f"💡 Change: <code>/shortlink site.com API</code>")
+    await message.reply(f"🔗 <b>Shortener</b>\n{SEP}\n\n🌍 <b>Site</b>: <code>{row.get('shortener') or SHORTLINK_URL}</code>\n"
+                        f"🔑 <b>API:</b> <code>{row.get('shortener_api') or SHORTLINK_API}</code>")
 
 
 # ---------------------------------------------------------------- run
