@@ -8,8 +8,11 @@ from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatMemberStatus, ParseMode
 from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated, UserNotParticipant
 from pyrogram.types import InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup
+
 from config import *
 
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s - %(levelname)s] - %(name)s - %(message)s")
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 db = pymongo.MongoClient(DB_URI)[DB_NAME]
@@ -17,7 +20,7 @@ users, settings = db["users"], db["config"]
 run = asyncio.to_thread
 
 app = Client("Bot", api_id=APP_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=WORKERS)
-state = {"started": datetime.now(), "username": "", "db_channel": None, "invite": ""}
+state = {"started": datetime.now(), "username": "", "invite": ""}
 STATES = {}
 DELIVERING = set()
 BROADCAST = {"running": False, "cancel": False}
@@ -48,42 +51,72 @@ def fmt(text, u):
     return text.format(first=u.first_name, last=u.last_name, id=u.id, mention=u.mention,
                        username="@" + u.username if u.username else None)
 
-def parse_link(payload):
+def candidates(nums):
+    low, high = 10**12 + 1, 10**12 + 10**10
+    first = nums[0]
+    start, end = max(1, -(-first // high)), first // low
+    if end - start > 2_000_000:
+        raise ValueError("number too large")
+    return [first // m for m in range(start, end + 1)
+            if first % m == 0 and all(x % (first // m) == 0 for x in nums)]
+
+async def parse_link(payload):
     parts = decode(payload).split("-")
     if parts[0] != "get" or len(parts) not in (2, 3):
         raise ValueError("unexpected link format")
-    n = abs(state["db_channel"].id)
     nums = [int(p) for p in parts[1:]]
-    if any(x <= 0 or x % n for x in nums):
-        raise ValueError("link was not generated for this DB channel")
+    if any(x <= 0 for x in nums):
+        raise ValueError("bad numbers")
+    found = candidates(nums)
+    if not found:
+        raise ValueError("no channel fits this link")
+    n = found[0]
+    if len(found) > 1:
+        for n in found:
+            try:
+                await app.get_chat(-n)
+                break
+            except Exception:
+                pass
+        else:
+            raise ValueError("no matching channel")
     ids = [x // n for x in nums]
     if len(ids) == 2:
         a, b = ids
         ids = range(a, b + 1) if a <= b else range(a, b - 1, -1)
-    return list(ids)
+    return -n, list(ids)
 
-async def get_messages(ids):
+async def get_messages(chat_id, ids):
+    await app.get_chat(chat_id)
     out = []
     for i in range(0, len(ids), 200):
         chunk = ids[i:i + 200]
         try:
-            out += await app.get_messages(state["db_channel"].id, chunk)
+            out += await app.get_messages(chat_id, chunk)
         except FloodWait as e:
             await asyncio.sleep(e.value)
-            out += await app.get_messages(state["db_channel"].id, chunk)
+            out += await app.get_messages(chat_id, chunk)
     return out
 
-def get_message_id(msg) -> int:
-    ch = state["db_channel"]
+async def bot_is_admin(chat_id):
+    try:
+        member = await app.get_chat_member(chat_id, "me")
+    except Exception:
+        return False
+    return member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
+
+async def get_message_id(msg):
     if msg.forward_from_chat:
-        return (msg.forward_from_message_id or 0) if msg.forward_from_chat.id == ch.id else 0
+        return msg.forward_from_chat.id, msg.forward_from_message_id or 0
     if msg.text and not msg.forward_sender_name:
-        m = re.match(r"https?://(?:t|telegram)\.me/(?:c/)?([^/\s]+)/(\d+)", msg.text.strip())
+        m = re.match(r"https?://(?:t|telegram)\.me/(c/)?([^/\s]+)/(\d+)", msg.text.strip())
         if m:
-            chan, mid = m.group(1), int(m.group(2))
-            if (chan.isdigit() and f"-100{chan}" == str(ch.id)) or (ch.username and chan.lower() == ch.username.lower()):
-                return mid
-    return 0
+            try:
+                chat = int("-100" + m.group(2)) if m.group(1) else (await app.get_chat(m.group(2))).id
+            except Exception:
+                return 0, 0
+            return chat, int(m.group(3))
+    return 0, 0
 
 async def get_shortlink(link: str) -> str:
     row = await run(settings.find_one, {"_id": "shortener_config"}) or {}
@@ -113,7 +146,7 @@ async def start(client, message):
 
     if len(message.command) > 1:
         try:
-            ids = parse_link(message.command[1])
+            chat_id, ids = await parse_link(message.command[1])
         except Exception as e:
             log.warning("Invalid start link: %s", e)
             return await message.reply("❌ Invalid link.")
@@ -122,7 +155,7 @@ async def start(client, message):
 
         wait = await message.reply("⏳ Please wait...")
         try:
-            msgs = await get_messages(ids)
+            msgs = await get_messages(chat_id, ids)
         except Exception:
             log.exception("Could not fetch files")
             return await wait.edit("⚠️ Something went wrong. Please try again later.")
@@ -134,11 +167,7 @@ async def start(client, message):
             for m in msgs:
                 if not m or m.empty:
                     continue
-                caption = m.caption.html if m.caption else ""
-                if CUSTOM_CAPTION and m.document:
-                    caption = CUSTOM_CAPTION.format(previouscaption=caption, filename=m.document.file_name)
-                kw = dict(chat_id=uid, caption=caption, parse_mode=ParseMode.HTML,
-                          reply_markup=None)
+                kw = dict(chat_id=uid, reply_markup=None)
                 try:
                     try:
                         await m.copy(**kw)
@@ -245,10 +274,10 @@ async def broadcast(client, message):
 @app.on_message(admin_pm & filters.command("genlink"))
 async def genlink(client, message):
     STATES[message.from_user.id] = {"first": None, "at": datetime.now()}
-    await message.reply("📨 Forward the <b>DB message</b> or send its link.")
+    await message.reply("📨 Forward the <b>file message</b> or send its link.")
 
-async def make_link(message, first, last):
-    n = abs(state["db_channel"].id)
+async def make_link(message, chat_id, first, last):
+    n = abs(chat_id)
     payload = f"get-{first * n}" if first == last else f"get-{first * n}-{last * n}"
     link = f"https://telegram.me/{state['username']}?start={encode(payload)}"
     short = await get_shortlink(link)
@@ -261,17 +290,21 @@ async def done(client, message):
     st = STATES.pop(message.from_user.id, None)
     if not st or not st["first"]:
         return await message.reply("❌ Nothing to finish. Use /genlink first.")
-    await make_link(message, st["first"], st["first"])
+    await make_link(message, st["chat"], st["first"], st["first"])
 
 async def link_input(message, st):
-    mid = get_message_id(message)
+    chat_id, mid = await get_message_id(message)
     if not mid:
-        return await message.reply("❌ This post/link is not from my DB channel.", quote=True)
+        return await message.reply("❌ This post/link is not from a channel.", quote=True)
     if st["first"] is None:
-        st["first"] = mid
-        return await message.reply("📩 Forward the <b>last</b> DB message or send its link or click /done")
+        if not await bot_is_admin(chat_id):
+            return await message.reply("❌ I must be an admin in that channel.", quote=True)
+        st.update(chat=chat_id, first=mid)
+        return await message.reply("📩 Forward the <b>last</b> file message or send its link or click /done")
+    if chat_id != st["chat"]:
+        return await message.reply("❌ The last message must be from the same channel.", quote=True)
     STATES.pop(message.from_user.id, None)
-    await make_link(message, st["first"], mid)
+    await make_link(message, chat_id, st["first"], mid)
 
 COMMANDS = ["start", "users", "broadcast", "genlink", "done", "shortlink", "shortener"]
 
@@ -326,13 +359,6 @@ async def main():
         except Exception as e:
             log.error("Can't get invite link for FORCE_SUB_CHANNEL=%s (is the bot admin there?): %s", FORCE_SUB_CHANNEL, e)
             return await app.stop()
-    try:
-        state["db_channel"] = await app.get_chat(CHANNEL_ID)
-        await (await app.send_message(CHANNEL_ID, "Test Message")).delete()
-    except Exception as e:
-        log.error("Make sure the bot is admin in the DB channel and CHANNEL_ID=%s is right: %s", CHANNEL_ID, e)
-        return await app.stop()
-
     routes = web.RouteTableDef()
 
     @routes.get("/", allow_head=True)
